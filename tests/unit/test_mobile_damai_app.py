@@ -1011,7 +1011,7 @@ class TestRunTicketGrabbing:
         enter_purchase_flow.assert_called_once_with(prepared=False)
         select_price.assert_called_once_with(cached_coords=(240, 1560))
         burst_click_coords.assert_called_with(
-            320, 1880, count=1, interval_ms=25, duration=25
+            320, 1880, count=10, interval_ms=(70, 130), duration=25
         )
 
     def test_run_ticket_grabbing_stops_before_submit_when_commit_disabled(self, bot):
@@ -1896,10 +1896,11 @@ class TestPageStateHelpers:
                                         )
 
         assert wait_ready.call_count == 2
-        burst_click.assert_called_once_with(
-            540, 2100, count=1, interval_ms=25, duration=25
+        assert burst_click.call_count == 2
+        burst_click.assert_called_with(
+            540, 2100, count=10, interval_ms=(70, 130), duration=25
         )
-        element_click.assert_called_once_with(burst_count=1)
+        element_click.assert_not_called()
 
     def test_ensure_attendees_selected_auto_selects_missing_checkbox(self, bot):
         checked_state = {"value": "false"}

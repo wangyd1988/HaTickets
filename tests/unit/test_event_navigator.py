@@ -246,6 +246,36 @@ class TestEnumerateSessionsFromXml:
         assert "上海" in cards[0]["text"]
         assert cards[1]["date"] == "04.13"
 
+    def test_flowlayout_variant_new_sku_page(self):
+        """新版 SKU 页：场次卡片是 ViewGroup，无 tv_date，日期直接落在卡片内。"""
+        xml = """<hierarchy>
+          <node resource-id="cn.damai:id/project_detail_perform_flowlayout">
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,625][1022,782]">
+              <node text="2026-10-31 周六 19:00"/>
+              <node text="无票"/>
+            </node>
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,782][1022,939]">
+              <node text="2026-11-01 周日 19:00"/>
+            </node>
+          </node>
+        </hierarchy>"""
+        cards = _enumerate_sessions_from_xml(xml)
+        assert len(cards) == 2
+        assert cards[0]["date"] == "2026-10-31 周六 19:00"
+        assert cards[0]["sold_out"] is True
+        assert cards[1]["date"] == "2026-11-01 周日 19:00"
+        assert cards[1]["sold_out"] is False
+
+    def test_flowlayout_ignores_non_clickable_children(self):
+        xml = """<hierarchy>
+          <node resource-id="cn.damai:id/project_detail_perform_flowlayout">
+            <node class="android.view.ViewGroup" clickable="false">
+              <node text="2026-11-07 周六 19:00"/>
+            </node>
+          </node>
+        </hierarchy>"""
+        assert _enumerate_sessions_from_xml(xml) == []
+
 
 class TestSelectSession:
     def _make_driver(self, xml):
@@ -253,6 +283,34 @@ class TestSelectSession:
         driver.dump_hierarchy.return_value = xml
         return driver
 
+    def test_unreadable_dates_raise_without_env_index(self, monkeypatch):
+        """自绘场次卡片读不到日期时必须报错，不能猜场次。"""
+        monkeypatch.delenv("HATICKETS_SESSION_INDEX", raising=False)
+        xml = """<hierarchy>
+          <node resource-id="cn.damai:id/project_detail_perform_flowlayout">
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,625][1022,782]">
+              <node text="无票"/>
+            </node>
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,782][1022,939]"/>
+          </node>
+        </hierarchy>"""
+        with pytest.raises(SessionNotFoundError, match="日期文本均无法从 UI 读取"):
+            select_session(self._make_driver(xml), date="11.01")
+
+    def test_unreadable_dates_fall_back_to_env_index(self, monkeypatch):
+        """显式给出 HATICKETS_SESSION_INDEX 时按位置选中并点击。"""
+        monkeypatch.setenv("HATICKETS_SESSION_INDEX", "1")
+        xml = """<hierarchy>
+          <node resource-id="cn.damai:id/project_detail_perform_flowlayout">
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,625][1022,782]">
+              <node text="无票"/>
+            </node>
+            <node class="android.view.ViewGroup" clickable="true" bounds="[58,782][1022,939]"/>
+          </node>
+        </hierarchy>"""
+        driver = self._make_driver(xml)
+        assert select_session(driver, date="11.01") == 1
+        driver.click.assert_called_once_with(540, 860)
     def test_raises_when_panel_missing(self):
         driver = self._make_driver("<hierarchy></hierarchy>")
         with pytest.raises(SessionNotFoundError, match="未发现可选场次"):

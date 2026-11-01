@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -344,7 +345,8 @@ class TestRushSubFlags:
 class TestMobileConfigLoadConfig:
     def test_load_config_dict_from_missing_path_raises(self, tmp_path):
         with pytest.raises(
-            FileNotFoundError, match=f"配置文件未找到: {tmp_path / 'missing.jsonc'}"
+            FileNotFoundError,
+            match=re.escape(f"配置文件未找到: {tmp_path / 'missing.jsonc'}"),
         ):
             _load_config_dict_from_path(tmp_path / "missing.jsonc")
 

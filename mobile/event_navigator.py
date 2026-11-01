@@ -8,6 +8,7 @@ while the actual implementation lives here.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -68,6 +69,7 @@ from mobile.page_helpers import (  # noqa: E402, F401
     _build_parent_map,
     _find_clickable_ancestor,
     _parse_bounds_center,
+    _parse_bounds_tuple,
     select_search_result,
     wait_for_home_ready,
 )
@@ -84,6 +86,57 @@ class SessionNotFoundError(RuntimeError):
 
 _SESSION_PANEL_RESOURCE_ID = "cn.damai:id/sku_panel_dates"
 _SESSION_DATE_RESOURCE_ID = "cn.damai:id/tv_date"
+# 新版 SKU 页把场次区与票档区放在同一页：场次卡片是 clickable 的 ViewGroup，
+# 没有 tv_date 子节点，日期文本直接落在卡片 descendants 上。旧版面板缺失时回退到这里。
+_SESSION_FLOWLAYOUT_RESOURCE_ID = "cn.damai:id/project_detail_perform_flowlayout"
+_SESSION_SOLD_OUT_TAGS = ("无票", "已售罄", "缺货登记")
+
+# MIUI 键盘（百度输入法小米版）的 QWERTY 主区域 resource-id。
+# 回车/搜索键是该区域最底行最右键，实测中心点距 inputArea 右缘约 70px、
+# 下缘约 81px（1080x2400 屏幕）。
+_KEYBOARD_INPUT_AREA_RESOURCE_ID = "android:id/inputArea"
+_ENTER_KEY_OFFSET_FROM_RIGHT = 70
+_ENTER_KEY_OFFSET_FROM_BOTTOM = 81
+
+
+def _safe_dump_hierarchy(bot) -> str:
+    """安全获取当前页面层级快照，失败时返回空字符串。"""
+    try:
+        return bot.dump_hierarchy()
+    except Exception:  # noqa: BLE001 — 快照失败按无键盘处理
+        return ""
+
+
+def _keyboard_enter_key_coords(xml_str: str) -> Optional[tuple]:
+    """从层级快照计算键盘回车（搜索）键的中心坐标。
+
+    MIUI 键盘的按键为自绘 View（无 resource-id、无 text），无法通过
+    选择器定位。但 ``android:id/inputArea`` 的 bounds 可读，回车键
+    固定位于该区域右下角。
+
+    Returns:
+        (x, y) 元组；键盘不可见或解析失败时返回 ``None``。
+    """
+    if not xml_str:
+        return None
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    for node in root.iter("node"):
+        if node.get("resource-id") != _KEYBOARD_INPUT_AREA_RESOURCE_ID:
+            continue
+        bounds = _parse_bounds_tuple(node.get("bounds"))
+        if bounds is None:
+            return None
+        left, top, right, bottom = bounds
+        if right - left <= 0 or bottom - top <= 0:
+            return None
+        return (
+            right - _ENTER_KEY_OFFSET_FROM_RIGHT,
+            bottom - _ENTER_KEY_OFFSET_FROM_BOTTOM,
+        )
+    return None
 
 
 def _enumerate_sessions_from_xml(xml_str: str) -> List[Dict[str, Any]]:
@@ -101,7 +154,7 @@ def _enumerate_sessions_from_xml(xml_str: str) -> List[Dict[str, Any]]:
             panel = node
             break
     if panel is None:
-        return []
+        return _enumerate_flowlayout_sessions(root)
 
     parent_map = _build_parent_map(root)
     cards: List[Dict[str, Any]] = []
@@ -123,6 +176,60 @@ def _enumerate_sessions_from_xml(xml_str: str) -> List[Dict[str, Any]]:
             }
         )
     return cards
+
+
+def _enumerate_flowlayout_sessions(root) -> List[Dict[str, Any]]:
+    """新版 SKU 页的场次枚举回退路径。
+
+    该布局下每个场次是一张 clickable 的 ``ViewGroup``，卡片内直接带
+    ``2026-11-01 周日 19:00`` 文本与 ``无票`` 之类标签。按竖直位置排序后
+    与用户看到的顺序一致。
+    """
+    panel = None
+    for node in root.iter("node"):
+        if node.get("resource-id") == _SESSION_FLOWLAYOUT_RESOURCE_ID:
+            panel = node
+            break
+    if panel is None:
+        return []
+
+    cards: List[Dict[str, Any]] = []
+    for child in panel:
+        if child.tag != "node" or child.get("clickable") != "true":
+            continue
+        texts = [
+            (desc.get("text") or "").strip()
+            for desc in child.iter("node")
+            if (desc.get("text") or "").strip()
+        ]
+        # 大麦用自绘 View 渲染场次日期，dump 里常常读不到日期文本
+        # （只读得到「无票」这类角标）。因此不能因为没文本就跳过卡片，
+        # 否则索引会错位、选中错误的场次。日期缺失时留空，交由调用方
+        # 按索引 / 位置兜底。
+        date_text = next((t for t in texts if normalize_date(t)), "")
+        sold_out = any(tag in t for t in texts for tag in _SESSION_SOLD_OUT_TAGS)
+        cards.append(
+            {
+                "index": len(cards),
+                "date": date_text,
+                "text": " ".join(texts),
+                "bounds": child.get("bounds"),
+                "sold_out": sold_out,
+            }
+        )
+    return cards
+
+
+def _session_index_from_env() -> Optional[int]:
+    """读取 HATICKETS_SESSION_INDEX 显式指定的场次位置（从 0 开始）。"""
+    raw = os.environ.get("HATICKETS_SESSION_INDEX", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("HATICKETS_SESSION_INDEX=%r 不是整数，已忽略", raw)
+        return None
 
 
 def _date_equals(card_date: str, target_date: str) -> bool:
@@ -196,7 +303,8 @@ def select_session(
     if not cards:
         _emit_err("select_session.no_cards")
         raise SessionNotFoundError(
-            "未发现可选场次（sku_panel_dates 内未找到 tv_date 节点）"
+            "未发现可选场次（旧版 sku_panel_dates/tv_date 与新版 "
+            "project_detail_perform_flowlayout 均未找到场次卡片）"
         )
 
     chosen: Optional[Dict[str, Any]] = None
@@ -240,6 +348,49 @@ def select_session(
             raise SessionNotFoundError(
                 f"date={date} 命中 {len(matches)} 条场次，需配合 city 才能确定"
             )
+
+    # 大麦自绘场次卡片读不到日期文本。此时 fallback_index 盲选会选到
+    # 已售罄的场次（调用方常传 0），必须由 HATICKETS_SESSION_INDEX 显式指定。
+    readable_dates = [c for c in cards if c["date"]]
+
+    env_index = _session_index_from_env()
+    if chosen is None and env_index is not None:
+        if 0 <= env_index < len(cards):
+            chosen = cards[env_index]
+            log_event(
+                logger,
+                "session_selected",
+                level=logging.WARNING,
+                match="env_session_index",
+                index=env_index,
+                total=len(cards),
+            )
+            logger.warning(
+                "已按 HATICKETS_SESSION_INDEX=%d 选择第 %d 个场次"
+                "（从 0 数，按屏幕从上到下）",
+                env_index,
+                env_index,
+            )
+        else:
+            _emit_err(
+                "select_session.env_index_out_of_range",
+                env_index=env_index,
+                total=len(cards),
+            )
+            raise SessionNotFoundError(
+                f"HATICKETS_SESSION_INDEX={env_index} 越界（共 {len(cards)} 条场次）"
+            )
+    elif chosen is None and not readable_dates:
+        _emit_err(
+            "select_session.dates_unreadable",
+            total=len(cards),
+            hint="场次日期为自绘 View，uiautomator 读不到文本",
+        )
+        raise SessionNotFoundError(
+            f"共 {len(cards)} 个场次，但日期文本均无法从 UI 读取"
+            "（大麦自绘控件）。请用 HATICKETS_SESSION_INDEX=<序号> "
+            "显式指定场次位置（从 0 开始，按屏幕从上到下）。"
+        )
 
     if chosen is None and fallback_index is not None:
         if 0 <= fallback_index < len(cards):
@@ -581,6 +732,88 @@ class EventNavigator:
                     timeout=0.8,
                 )
                 time.sleep(0.1)
+
+            # ── 检查搜索是否真的提交了 ──
+            # 某些键盘（如搜狗）不响应 KEYCODE_ENTER 的 IME action，
+            # 需要直接点键盘右下角的「搜索」按钮。
+            submit_deadline = time.time() + 2.0
+            submitted = False
+            while time.time() < submit_deadline:
+                if bot._find_all(By.ID, "cn.damai:id/ll_search_item"):
+                    submitted = True
+                    break
+                time.sleep(0.1)
+
+            if not submitted:
+                logger.info("按 Enter 未触发搜索，尝试点击键盘「搜索」按钮")
+                # 尝试 KEYCODE_SEARCH
+                bot._press_keycode_safe(84, context="备用搜索提交")
+                time.sleep(1.0)
+                if bot._find_all(By.ID, "cn.damai:id/ll_search_item"):
+                    submitted = True
+
+            if not submitted:
+                # 尝试点击键盘右下角的回车（搜索）键。
+                # 注意：com.miui.phrase:id/input_bottom_button_right 是「剪贴板和
+                # 常用语」按钮，点击会打开全屏剪贴板面板，绝不能点。
+                device = getattr(bot, "d", None) or getattr(bot, "driver", None)
+                if device is None:
+                    logger.warning("无可用设备句柄，无法点击键盘搜索按钮")
+                    return False
+
+                # 方案 A：按键盘 inputArea 坐标点击右下角回车键（MIUI 实测有效）
+                xml_str = _safe_dump_hierarchy(device)
+                enter_coords = _keyboard_enter_key_coords(xml_str)
+                if enter_coords is not None:
+                    device.click(*enter_coords)
+                    wait_deadline = time.time() + 2.0
+                    while time.time() < wait_deadline:
+                        if bot._find_all(By.ID, "cn.damai:id/ll_search_item"):
+                            submitted = True
+                            break
+                        time.sleep(0.1)
+
+                # 方案 B：搜狗等输入法的搜索按钮（通过 resource-id）
+                if not submitted:
+                    for by, value in [
+                        (By.ID, "com.sohu.inputmethod.sogou:id/keyboard_search"),
+                        (ANDROID_UIAUTOMATOR, 'new UiSelector().text("搜索")'),
+                    ]:
+                        try:
+                            btn = bot._wait_for_element(by, value, timeout=0.5)
+                            if btn is not None:
+                                bot._click_element_center(btn)
+                                time.sleep(1.5)
+                                if bot._find_all(
+                                    By.ID, "cn.damai:id/ll_search_item"
+                                ):
+                                    submitted = True
+                                    break
+                        except Exception:  # noqa: BLE001 — 尽力尝试
+                            continue
+
+                # 方案 B：点击常见位置
+                if not submitted:
+                    try:
+                        w, h = device.window_size()
+                    except Exception:
+                        w, h = 1080, 2400
+                    search_btn_positions = [
+                        (int(w * 0.92), int(h * 0.84)),  # 右下角
+                        (int(w * 0.92), int(h * 0.80)),  # 稍高一点
+                        (int(w * 0.50), int(h * 0.84)),  # 中间偏下
+                    ]
+                    for sx, sy in search_btn_positions:
+                        device.click(sx, sy)
+                        time.sleep(1.5)
+                        if bot._find_all(By.ID, "cn.damai:id/ll_search_item"):
+                            submitted = True
+                            break
+
+            if not submitted:
+                logger.warning("搜索关键词提交失败：Enter 与键盘搜索按钮均未触发搜索")
+                return False
+
             try:
                 deadline = time.time() + 3.5
                 while time.time() < deadline:

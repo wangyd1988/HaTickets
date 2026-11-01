@@ -8,6 +8,7 @@ inherits from this class so all ``self._find()`` / ``self._click_coordinates()``
 etc. calls continue to work transparently via inheritance.
 """
 
+import random
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -210,10 +211,19 @@ class UIPrimitives:
                 time.sleep(interval_ms / 1000)
 
     def _burst_click_coordinates(self, x, y, count=2, interval_ms=35, duration=30):
-        """Click a fixed coordinate repeatedly."""
+        """Click a fixed coordinate repeatedly.
+
+        interval_ms 传 (min_ms, max_ms) 元组时启用随机脉冲：每次点击
+        间隔在区间内均匀随机取样（如 70~130ms），模拟真人手速抖动。
+        """
+        jittered = isinstance(interval_ms, (tuple, list)) and len(interval_ms) == 2
         for attempt in range(count):
             self._click_coordinates(x, y, duration=duration)
-            if attempt < count - 1 and interval_ms > 0:
+            if attempt >= count - 1:
+                continue
+            if jittered:
+                time.sleep(random.uniform(interval_ms[0], interval_ms[1]) / 1000)
+            elif interval_ms > 0:
                 time.sleep(interval_ms / 1000)
 
     def ultra_fast_click(self, by, value, timeout=1.5):

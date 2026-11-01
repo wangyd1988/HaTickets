@@ -40,7 +40,12 @@ class PageState(str, Enum):
 
 
 # Markers used to recognise the multi-session date picker on the SKU page.
-_SESSION_PICKER_RESOURCE_IDS = ("cn.damai:id/sku_panel_dates",)
+_SESSION_PICKER_RESOURCE_IDS = (
+    "cn.damai:id/sku_panel_dates",
+    # 新版 SKU 页：场次区与票档区同页，场次卡片位于 perform_flowlayout 内。
+    # 命中它说明必须先选场次，否则票档区展示的是默认场次（常为「无票」）。
+    "cn.damai:id/project_detail_perform_flowlayout",
+)
 _SESSION_PICKER_TEXTS = (
     "请选择场次",
     "选择日期",

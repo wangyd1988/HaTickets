@@ -97,7 +97,7 @@ def main(argv=None) -> int:
             terminal_reason = f"init_error: {exc}"
         else:
             try:
-                success = bot.run_with_retry(max_retries=3)
+                success = bot.run_with_retry(max_retries=100000)
             except KeyboardInterrupt:
                 exit_code, outcome = EXIT_INTERRUPTED, "interrupted"
                 terminal_reason = "keyboard_interrupt"

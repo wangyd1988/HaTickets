@@ -335,6 +335,11 @@ class DamaiBot(
 
         serial = getattr(self.config, "serial", None) or None
         self.d = u2.connect(serial)
+        # MIUI 兼容层（可选）：UiAutomation 触摸注入被拦时改走 adb input
+        from mobile.miui_adb_input import apply_miui_adb_input, miui_adb_input_enabled
+
+        if miui_adb_input_enabled():
+            apply_miui_adb_input(self.d, serial)
         try:
             self.d.settings["wait_timeout"] = 0
             self.d.settings["operation_delay"] = (0, 0)
@@ -526,15 +531,71 @@ class DamaiBot(
             return None
 
     def select_performance_date(self, timeout=1.0):
-        """选择演出场次日期"""
+        """选择演出场次日期。
+
+        旧版 sku_panel_dates 面板用 textContains 匹配日期文本。
+        新版 SKU 页把场次卡片放在 project_detail_perform_flowlayout，
+        日期文本是大麦自绘 View，uiautomator 根本读不到 → 回退到
+        select_session（flowlayout 枚举 + HATICKETS_SESSION_INDEX 兜底）。
+        """
         if not self.config.date:
             return
 
         date_selector = f'new UiSelector().textContains("{self.config.date}")'
         if self.ultra_fast_click(ANDROID_UIAUTOMATOR, date_selector, timeout=timeout):
             logger.info(f"选择场次日期: {self.config.date}")
-        else:
-            logger.debug(f"未找到日期 '{self.config.date}'，使用默认场次")
+            return
+
+        logger.debug(f"未找到日期 '{self.config.date}'，使用默认场次")
+
+        # 新版 flowlayout 场次区兜底：日期读不到时按 env 索引选场
+        from mobile.event_navigator import select_session
+
+        try:
+            chosen_idx = select_session(
+                self.d,
+                date=self.config.date,
+                city=self.config.city,
+            )
+            logger.info("select_session 已选定场次 idx=%d", chosen_idx)
+            # 选场后票档区会异步刷新：不等待就去点票档会点到上一个场次的卡片
+            # 或空布局（price_index 越界 / 可点击卡片数量 0）。
+            self._await_price_refresh_after_session_switch(chosen_idx)
+        except Exception as exc:
+            logger.debug("select_session 回退失败: %s", exc)
+
+    def _await_price_refresh_after_session_switch(self, chosen_idx, timeout=1.2):
+        """选场后等待票档区刷新，避免把上一个场次的票档当成当前场次。
+
+        返回 True 表示检测到可点票档；False 表示票档区为空或全部缺货。
+        结果只用于日志与失败诊断，不阻断主流程（票档选择自身还有重试）。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self._has_element(
+                    By.ID, "cn.damai:id/project_detail_perform_price_flowlayout"
+                ):
+                    cards = self._container_find_elements(
+                        self._find(
+                            By.ID,
+                            "cn.damai:id/project_detail_perform_price_flowlayout",
+                        ),
+                        By.CLASS_NAME,
+                        "android.widget.FrameLayout",
+                    )
+                    if cards:
+                        logger.info(
+                            "场次 idx=%d 切换后票档已刷新（%d 张卡片）",
+                            chosen_idx,
+                            len(cards),
+                        )
+                        return True
+            except Exception as exc:  # noqa: BLE001 — 刷新期元素缺失属正常
+                logger.debug("票档刷新探测失败: %s", exc)
+            time.sleep(0.08)
+        logger.warning("场次 idx=%d 切换后未检测到票档卡片（可能全部缺货）", chosen_idx)
+        return False
 
     def _handle_session_picker(self):
         """SESSION_PICKER 状态下按 config.date / config.city 选定场次。
@@ -567,6 +628,9 @@ class DamaiBot(
                 normalised_date,
                 self.config.city,
             )
+            # 选场后票档区会异步刷新：不等待就去点票档会点到上一个场次的卡片
+            # 或空布局（price_index 越界 / 可点击卡片数量 0）。
+            self._await_price_refresh_after_session_switch(chosen_idx)
             return True
         except SessionNotFoundError as exc:
             logger.error("多场次活动：select_session 失败 — %s", exc)
@@ -958,7 +1022,7 @@ class DamaiBot(
             #     for i in range(len(self.config.users) - 1):
             #         self.driver.find_element(by=By.ID, value='img_jia').click()
 
-            # 5. 确定购买 — brief wait for price selection to register.
+            # 5. 确定购买 — 随机脉冲连击购买按钮（常驻 adb shell 通道）。
             # Damai App ignores confirm clicks until btn_buy_view becomes clickable (price > 0).
             time.sleep(0.5)
             logger.info("确定购买...")
@@ -968,48 +1032,36 @@ class DamaiBot(
             while time.time() < confirm_deadline and not submit_ready:
                 confirm_attempt += 1
                 if self.config.rush_mode and buy_button_coords:
-                    if confirm_attempt == 1:
-                        burst_count = 1 if not self.config.if_commit_order else 2
-                        self._burst_click_coordinates(
-                            *buy_button_coords,
-                            count=burst_count,
-                            interval_ms=25,
-                            duration=25,
-                        )
-                    else:
-                        burst_count = 1 if not self.config.if_commit_order else 2
-                        if not self._click_sku_buy_button_element(
-                            burst_count=burst_count
-                        ):
-                            self._burst_click_coordinates(
-                                *buy_button_coords,
-                                count=burst_count,
-                                interval_ms=25,
-                                duration=25,
-                            )
+                    # 随机脉冲：每次点击间隔在 70~130ms 内均匀随机
+                    # （如 0.07s, 0.13s, 0.08s, 0.09s…），模拟真人手速抖动。
+                    self._burst_click_coordinates(
+                        *buy_button_coords,
+                        count=10,
+                        interval_ms=(70, 130),
+                        duration=25,
+                    )
                 elif self.config.rush_mode:
                     # Element click may not work on Damai's custom btn_buy_view —
                     # use coordinate click from XML bounds as primary method.
                     _buy_coords = self._get_buy_button_coordinates()
                     if _buy_coords:
-                        burst_count = 1 if not self.config.if_commit_order else 2
                         self._burst_click_coordinates(
-                            *_buy_coords, count=burst_count, interval_ms=25, duration=25
+                            *_buy_coords,
+                            count=10,
+                            interval_ms=(70, 130),
+                            duration=25,
                         )
                         buy_button_coords = _buy_coords  # cache for next retry
                     else:
-                        burst_count = 1 if not self.config.if_commit_order else 2
-                        if not self._click_sku_buy_button_element(
-                            burst_count=burst_count
-                        ):
+                        if not self._click_sku_buy_button_element(burst_count=10):
                             try:
                                 buy_button = self._find(
                                     By.ID, "cn.damai:id/btn_buy_view"
                                 )
                                 self._burst_click_element_center(
                                     buy_button,
-                                    count=burst_count,
-                                    interval_ms=25,
+                                    count=10,
+                                    interval_ms=(70, 130),
                                     duration=25,
                                 )
                             except Exception:
@@ -1022,7 +1074,7 @@ class DamaiBot(
                         )
                 # Short wait then check if confirm page appeared
                 remaining = confirm_deadline - time.time()
-                check_timeout = min(1.0, max(0.1, remaining))
+                check_timeout = min(0.15, max(0.05, remaining))
                 submit_ready = self._wait_for_submit_ready(
                     timeout=check_timeout,
                     poll_interval=0.03 if self.config.rush_mode else 0.05,
@@ -1136,7 +1188,16 @@ class DamaiBot(
                 )
                 if fast_attempt > 0 and self.config.fast_retry_interval_ms > 0:
                     time.sleep(self.config.fast_retry_interval_ms / 1000)
-                if self._fast_retry_from_current_state():
+                try:
+                    fast_ok = self._fast_retry_from_current_state()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    # u2 RPC 掉线（RemoteDisconnected 等）不应终止整个抢票循环；
+                    # 长跑模式下跳过本轮快速重试，交由外层尝试继续。
+                    logger.warning(f"快速重试遇到连接异常，跳过本轮: {exc}")
+                    continue
+                if fast_ok:
                     self._log_success_outcome("快速重试成功：")
                     return True
                 if self._terminal_failure_reason:
@@ -1159,7 +1220,14 @@ class DamaiBot(
                     self.driver.quit()
                 except Exception:
                     pass
-                self._setup_driver()
+                try:
+                    self._setup_driver()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    # 设备短暂离线（USB 抖动）时重建失败不应终止整个抢票循环。
+                    logger.warning(f"驱动重建失败，保留旧会话继续: {exc}")
+                    time.sleep(5)  # 给 USB 重连留时间，避免热转
 
         logger.error("所有尝试均失败")
         return False

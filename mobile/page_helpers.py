@@ -76,6 +76,17 @@ def _parse_bounds_center(bounds_str: Optional[str]) -> Optional[tuple]:
     return ((x1 + x2) // 2, (y1 + y2) // 2)
 
 
+def _parse_bounds_tuple(bounds_str: Optional[str]) -> Optional[tuple]:
+    """Parse ``[x1,y1][x2,y2]`` into ``(left, top, right, bottom)``."""
+    if not bounds_str:
+        return None
+    match = _BOUNDS_RE.match(bounds_str)
+    if not match:
+        return None
+    x1, y1, x2, y2 = (int(v) for v in match.groups())
+    return (x1, y1, x2, y2)
+
+
 def _build_parent_map(root: ET.Element) -> Dict[ET.Element, ET.Element]:
     return {child: parent for parent in root.iter() for child in parent}
 
