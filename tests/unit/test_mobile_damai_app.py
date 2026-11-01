@@ -236,7 +236,10 @@ class TestU2BackendAdapters:
         bot.driver = bot.d
 
         bot._click_coordinates(10, 20, duration=30)
-        bot.d.click.assert_called_once_with(10, 20)
+        # 真人抖动：落点应在目标点周围 _TAP_JITTER_RADIUS_PX 半径的圆内
+        bot.d.click.assert_called_once()
+        (cx, cy), _kw = bot.d.click.call_args
+        assert (cx - 10) ** 2 + (cy - 20) ** 2 <= 8 ** 2
 
     def test_has_element_u2_uses_selector_exists(self):
         cfg = Config(
@@ -4638,7 +4641,10 @@ class TestClickHelpers:
     def test_click_element_center_calls_u2_click(self, bot):
         el = _make_mock_element(x=100, y=200, width=50, height=40)
         bot._click_element_center(el)
-        bot.d.click.assert_called_with(125, 220)
+        # 真人抖动：落点应在元素中心 (125, 220) 周围半径 8px 圆内
+        bot.d.click.assert_called_once()
+        (cx, cy), _kw = bot.d.click.call_args
+        assert (cx - 125) ** 2 + (cy - 220) ** 2 <= 8 ** 2
 
     def test_burst_click_element_center_calls_multiple_times(self, bot):
         el = _make_mock_element(x=100, y=200, width=50, height=40)

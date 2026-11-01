@@ -8,6 +8,7 @@ inherits from this class so all ``self._find()`` / ``self._click_coordinates()``
 etc. calls continue to work transparently via inheritance.
 """
 
+import math
 import random
 import re
 import time
@@ -29,6 +30,10 @@ logger = get_logger(__name__)
 # Constant replacing the former AppiumBy.ANDROID_UIAUTOMATOR selector type.
 # Used as a routing key in _appium_selector_to_u2 / _parse_uiselector.
 ANDROID_UIAUTOMATOR = "android_uiautomator"
+
+# 真人手指落点抖动半径（px）：每次坐标点击在目标点周围该半径的圆内
+# 均匀随机偏移，模拟真人连续点击时落点不完全重合的手部抖动。
+_TAP_JITTER_RADIUS_PX = 8
 
 
 class UIPrimitives:
@@ -173,9 +178,18 @@ class UIPrimitives:
     # ------------------------------------------------------------------
 
     def _click_coordinates(self, x, y, duration=50):
-        """Click a fixed screen coordinate via gesture."""
+        """Click a screen coordinate via gesture.
+
+        每次点击在目标点周围半径 8px 的圆内均匀随机偏移
+        （等面积分布：半径按 sqrt(rand) 取样），模拟真人手指
+        落点抖动——连续点击不会落在同一个像素上。
+        """
         x = int(x)
         y = int(y)
+        angle = random.uniform(0, 2 * math.pi)
+        radius = _TAP_JITTER_RADIUS_PX * math.sqrt(random.random())
+        x += int(round(math.cos(angle) * radius))
+        y += int(round(math.sin(angle) * radius))
         if not self._using_u2():
             self.driver.execute_script(
                 "mobile: clickGesture",
